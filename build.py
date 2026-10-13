@@ -10,6 +10,8 @@ import duckdb
 
 OUT = 'out'
 MAX_BYTES = 950 * 1024 * 1024          # limite GitHub Pages : 1 Go
+SPLIT_OVER = 3000                       # au-delà : sous-carrés de 0,25°
+SPLIT_KEYS = []
 MIN_CONF = float(os.environ.get('MIN_CONF', '0.6'))
 
 # métier Overture (catégorie) → (catégorie Taskr, métier affiché). Ordre = priorité.
@@ -123,7 +125,7 @@ def main():
     meta = {
         'release': rel, 'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'min_confidence': conf_floor,
         'fields': ['id', 'name', 'cat', 'trade', 'lat', 'lng', 'phone', 'web', 'street', 'city', 'cc', 'conf', 'nsrc'],
-        'cats': CATS, 'tiles': tiles, 'bytes': total,
+        'cats': CATS, 'tiles': tiles, 'split': SPLIT_KEYS, 'sub': 4, 'bytes': total,
         'attribution': '© Overture Maps Foundation (CDLA-Permissive-2.0) et sources partenaires : https://docs.overturemaps.org/attribution/',
     }
     with open(OUT + '/index.json', 'w') as f:
@@ -140,17 +142,33 @@ def write_tiles(con, floor_conf):
       FROM 'places.parquet' WHERE conf >= {floor_conf} ORDER BY ty, tx
     """)
     total, tiles, key, buf = 0, {}, None, []
+    global SPLIT_KEYS
+    SPLIT_KEYS = []
 
-    def flush():
+    def write(name, rows):
         nonlocal total
-        if key is None or not buf:
-            return
-        name = f'{key[0]}_{key[1]}.json'
-        data = json.dumps({'v': 1, 'r': buf}, ensure_ascii=False, separators=(',', ':'))
-        with open(f'{OUT}/t/{name}', 'w', encoding='utf-8') as f:
+        data = json.dumps({'v': 1, 'r': rows}, ensure_ascii=False, separators=(',', ':'))
+        with open(f'{OUT}/t/{name}.json', 'w', encoding='utf-8') as f:
             f.write(data)
         total += len(data.encode('utf-8'))
-        tiles[f'{key[0]}_{key[1]}'] = len(buf)
+
+    def flush():
+        if key is None or not buf:
+            return
+        k = f'{key[0]}_{key[1]}'
+        tiles[k] = len(buf)
+        if len(buf) <= SPLIT_OVER:
+            write(k, buf)
+            return
+        # carré dense (grande ville) : découpé en 4 x 4 sous-carrés de 0,25° pour alléger le téléchargement
+        SPLIT_KEYS.append(k)
+        subs = {}
+        for r in buf:
+            i = min(3, max(0, int((r[4] - key[0]) * 4)))
+            j = min(3, max(0, int((r[5] - key[1]) * 4)))
+            subs.setdefault(f'{k}_{i}_{j}', []).append(r)
+        for name, rows in subs.items():
+            write(name, rows)
 
     while True:
         rows = cur.fetchmany(20000)
